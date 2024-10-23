@@ -1,73 +1,130 @@
 import os
 import json
-import fuse
-from fuse import FUSE, Operations
 import errno
+from fuse import FUSE, FuseOSError, Operations
 
 class JSONFS(Operations):
     def __init__(self, json_file):
-        # Завантажуємо JSON-файл як словник
         self.json_file = json_file
         with open(json_file, 'r') as f:
             self.data = json.load(f)
+        self.fd = 0  # Файловий дескриптор
 
     def getattr(self, path, fh=None):
-        # Повертаємо інформацію про файл або каталог
         keys = self._get_path_keys(path)
         if keys is None:
-            raise fuse.FuseOSError(errno.ENOENT)
+            raise FuseOSError(errno.ENOENT)
+
+        uid, gid = os.getuid(), os.getgid()
 
         if isinstance(keys, dict):
-            return dict(st_mode=(os.stat.S_IFDIR | 0o755), st_nlink=2)
+            return {
+                'st_mode': (0o40777),  # Каталог з повними правами
+                'st_nlink': 2,
+                'st_uid': uid,
+                'st_gid': gid
+            }
         else:
-            return dict(st_mode=(os.stat.S_IFREG | 0o644), st_size=len(str(keys)))
+            return {
+                'st_mode': (0o100666),  # Файл з правами читання та запису
+                'st_nlink': 1,
+                'st_size': len(str(keys)),
+                'st_uid': uid,
+                'st_gid': gid
+            }
 
     def readdir(self, path, fh):
-        # Читаємо вміст каталогу
         keys = self._get_path_keys(path)
         if isinstance(keys, dict):
             return ['.', '..'] + list(keys.keys())
-        raise fuse.FuseOSError(errno.ENOTDIR)
+        raise FuseOSError(errno.ENOTDIR)
 
     def read(self, path, size, offset, fh):
-        # Читаємо вміст файлу
         keys = self._get_path_keys(path)
         if isinstance(keys, dict):
-            raise fuse.FuseOSError(errno.EISDIR)
-        return str(keys).encode('utf-8')[offset:offset + size]
+            raise FuseOSError(errno.EISDIR)
+        data = str(keys).encode('utf-8')
+        return data[offset:offset + size]
 
-    def write(self, path, data, offset, fh):
-        # Записуємо дані у файл (оновлюємо JSON)
-        keys = self._get_path_keys(path, create_if_missing=True)
-        if isinstance(keys, dict):
-            raise fuse.FuseOSError(errno.EISDIR)
+    def open(self, path, flags):
+        # Дозволяємо відкриття файлу для читання та запису
+        self.fd += 1
+        return self.fd
 
-        # Оновлюємо значення в JSON
-        parent_keys, final_key = self._get_parent_keys(path)
-        parent = self._get_path_keys(parent_keys)
-        parent[final_key] = data.decode('utf-8').strip()
-
-        # Зберігаємо зміни в JSON-файлі
-        self._save_json()
-        return len(data)
-
-    def create(self, path, mode):
-        # Створюємо новий файл в JSON
+    def create(self, path, mode, fi=None):
         parent_keys, final_key = self._get_parent_keys(path)
         parent = self._get_path_keys(parent_keys, create_if_missing=True)
 
         if final_key in parent:
-            raise fuse.FuseOSError(errno.EEXIST)
+            raise FuseOSError(errno.EEXIST)
 
         # Додаємо новий ключ з пустим значенням
         parent[final_key] = ""
 
         # Зберігаємо зміни
         self._save_json()
-        return 0
+
+        self.fd += 1
+        return self.fd
+
+    def write(self, path, data, offset, fh):
+        keys = self._get_path_keys(path, create_if_missing=True)
+        if isinstance(keys, dict):
+            raise FuseOSError(errno.EISDIR)
+
+        parent_keys, final_key = self._get_parent_keys(path)
+        parent = self._get_path_keys(parent_keys)
+
+        # Записуємо дані (як рядок)
+        value = data.decode('utf-8')
+
+        if offset == 0:
+            parent[final_key] = value
+        else:
+            parent[final_key] += value
+
+        # Зберігаємо зміни
+        self._save_json()
+        return len(data)
+
+    def truncate(self, path, length, fh=None):
+        keys = self._get_path_keys(path, create_if_missing=True)
+        if isinstance(keys, dict):
+            raise FuseOSError(errno.EISDIR)
+
+        parent_keys, final_key = self._get_parent_keys(path)
+        parent = self._get_path_keys(parent_keys)
+        parent[final_key] = parent[final_key][:length]
+
+        # Зберігаємо зміни
+        self._save_json()
+
+    def unlink(self, path):
+        parent_keys, final_key = self._get_parent_keys(path)
+        parent = self._get_path_keys(parent_keys)
+        if final_key in parent:
+            del parent[final_key]
+            self._save_json()
+        else:
+            raise FuseOSError(errno.ENOENT)
+
+    def mkdir(self, path, mode):
+        parent_keys, final_key = self._get_parent_keys(path)
+        parent = self._get_path_keys(parent_keys, create_if_missing=True)
+
+        if final_key in parent:
+            raise FuseOSError(errno.EEXIST)
+
+        # Додаємо новий порожній словник
+        parent[final_key] = {}
+
+        # Зберігаємо зміни
+        self._save_json()
+
+    def rmdir(self, path):
+        self.unlink(path)
 
     def _get_path_keys(self, path, create_if_missing=False):
-        # Отримуємо ключі для шляху
         keys = self.data
         if path == '/':
             return keys
@@ -82,18 +139,16 @@ class JSONFS(Operations):
         return keys
 
     def _get_parent_keys(self, path):
-        # Повертає шлях до батьківського каталогу та кінцевий ключ
         parts = path.strip('/').split('/')
         parent_keys = '/' + '/'.join(parts[:-1])
         final_key = parts[-1]
         return parent_keys, final_key
 
     def _save_json(self):
-        # Зберігаємо зміни в JSON-файлі
         with open(self.json_file, 'w') as f:
             json.dump(self.data, f, indent=4)
 
 if __name__ == '__main__':
     json_file = 'data.json'
     mount_point = './mnt'
-    FUSE(JSONFS(json_file), mount_point, foreground=True)
+    FUSE(JSONFS(json_file), mount_point, foreground=True, allow_other=True)
