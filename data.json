@@ -1,0 +1,11 @@
+{
+    "config": {
+        "version": "1.0.0",
+        "features": {
+            "feature_a": true,
+            "feature_b": false
+        }
+    },
+    "status": "running",
+    "users": ["user1", "user2", "user3"]
+}
